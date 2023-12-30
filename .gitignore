@@ -1,0 +1,5 @@
+/target
+*.svg
+*.data
+*.data.old
+*.pem

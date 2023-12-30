@@ -1,0 +1,17 @@
+[server]
+certificate = "keys/cert.pem"
+server_addr = "127.0.0.1"
+tls_hostname = "shroom.server"
+
+[proxy]
+proxy_id = 1
+timeout = "30s"
+blacklist_file = "blacklist/ipsum.txt"
+
+[[mappings]]
+from_port = 9484
+to_port = 8484
+
+[[mappings]]
+from_port = 9485
+to_port = 8485

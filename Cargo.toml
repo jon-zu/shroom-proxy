@@ -1,0 +1,34 @@
+[package]
+name = "shroom_proxy"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = true
+
+[lib]
+src = "src/lib.rs"
+
+[[bin]]
+name = "shroom_proxy"
+path = "src/main.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+shroom-net = { git = "ssh://git@github.com/jon-zu/shroom-net.git" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tokio-util = { version = "0.7", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["full"] }
+futures = "0.3.30"
+log = "0.4.20"
+tokio-native-tls = "0.3.1"
+governor = "0.6.0"
+config = "0.13.4"
+serde = { version = "1.0.193", features = ["derive"] }
+clap-serde-derive = "0.2.1"
+clap = { version = "4.4.12", features = ["derive"] }
+lru = "0.12.1"
+env_logger = "0.10.1"
+duration-string = { version = "0.3.0", features = ["serde"] }
