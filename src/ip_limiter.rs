@@ -101,7 +101,7 @@ impl IpContext {
 
 #[derive(Debug)]
 pub struct IpLimiter<Ip: IpAddr> {
-    blacklist: IpBlacklist<Ip>,
+    blacklist: Arc<IpBlacklist<Ip>>,
     connection_limits: lru::LruCache<Ip, IpContext>,
     minute_limit: NonZeroU32,
     conn_limit: usize
@@ -111,7 +111,7 @@ impl<Ip> IpLimiter<Ip>
 where
     Ip: IpAddr,
 {
-    pub fn new(blacklist: IpBlacklist<Ip>, cache: NonZeroUsize, minute_limit: NonZeroU32, conn_limit: usize) -> Self {
+    pub fn new(blacklist: Arc<IpBlacklist<Ip>>, cache: NonZeroUsize, minute_limit: NonZeroU32, conn_limit: usize) -> Self {
         IpLimiter {
             blacklist,
             connection_limits: lru::LruCache::new(cache),

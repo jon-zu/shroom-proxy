@@ -8,47 +8,37 @@ use std::{
 use futures::{SinkExt, StreamExt};
 
 use governor::{
-    clock,
+    clock::{self},
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
     Quota,
 };
+
 use shroom_net::{
     codec::{legacy::LegacyCodec, ShroomCodec},
     ShroomConn,
 };
 use tokio::{
-    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tokio_native_tls::TlsStream;
+
 use tokio_stream::wrappers::TcpListenerStream;
-use tokio_util::{
-    bytes::BufMut,
-    codec::{length_delimited, Framed, LengthDelimitedCodec},
+
+use crate::{
+    ip_limiter::{IpConnectionHolder, IpLimiter},
+    proxy_conn::{ProxyConn, ProxyConnector},
 };
 
-use crate::ip_limiter::{IpConnectionHolder, IpLimiter};
+//const PACKET_LEN_LIMIT: usize = 8 * 1024;
 
-const PACKET_LEN_LIMIT: usize = 8 * 1024;
-
-type ServerConn = Framed<TlsStream<TcpStream>, LengthDelimitedCodec>;
 type RemoteConn = ShroomConn<LegacyCodec>;
 
 pub type RateLimiter =
     governor::RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>;
-
-fn server_codec() -> LengthDelimitedCodec {
-    length_delimited::LengthDelimitedCodec::builder()
-        .big_endian()
-        .max_frame_length(PACKET_LEN_LIMIT)
-        .length_field_type::<u32>()
-        .new_codec()
-}
-
-pub struct ProxyConn {
-    server: ServerConn,
+    
+pub struct ProxySession {
+    server: ProxyConn,
     remote: RemoteConn,
     timeout: Duration,
     limit_s: RateLimiter,
@@ -56,9 +46,9 @@ pub struct ProxyConn {
     _conn_holder: IpConnectionHolder,
 }
 
-impl ProxyConn {
+impl ProxySession {
     pub fn new(
-        server: ServerConn,
+        server: ProxyConn,
         remote: RemoteConn,
         cfg: &ProxyConfig,
         conn_holder: IpConnectionHolder,
@@ -73,87 +63,88 @@ impl ProxyConn {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         let (remote_r, remote_w) = self.remote.split();
+        let (mut server_w, mut server_r) = self.server.split();
 
-        loop {
-            tokio::select! {
-                Some(packet) = remote_r.0.next() => {
-                    let packet = packet?;
+        log::info!("Running proxy: {}", self.timeout.as_nanos());
 
-                    let n = packet.as_ref().len();
-                    let n = NonZeroU32::new(n as u32).unwrap();
-                    self.limit_s.until_n_ready(n).await?;
-                    self.limit_m.until_n_ready(n).await?;
+        let reader = async move {
+            while let Some(pkt) = remote_r.next().await {
+                let pkt = pkt?;
+                let n = NonZeroU32::new(pkt.as_ref().len() as u32 + 4).unwrap();
+                self.limit_m.until_n_ready(n).await?;
+                self.limit_s.until_n_ready(n).await?;
 
-                    let packet = packet.as_ref().clone(); // TODO get rid off this
-                    self.server.send(packet).await?;
-                }
-                Some(packet) = self.server.next() => {
-                    let packet = packet?;
-                    remote_w.0.send(&packet).await?;
-                },
-                _ = tokio::time::sleep(self.timeout) => {
-                    return Err(anyhow::anyhow!("Timeout"));
-                }
+                server_w.send(pkt.as_ref().clone().into()).await?;
             }
+
+            anyhow::Ok(())
+        };
+
+        let writer = async move {
+            while let Some(pkt) = server_r.next().await {
+                let pkt = pkt?;
+                remote_w.send(pkt).await?;
+            }
+
+            anyhow::Ok(())
+        };
+
+        tokio::select! {
+            r = reader => r?,
+            w = writer => w?,
         }
+
+        self.remote.close().await?;
+        //server_w.close().await?;
+        Ok(())
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
-    pub server_addr: IpAddr,
-    pub port_mappings: Vec<(u16, u16)>,
-    pub proxy_id: u32,
-    pub proxy_version: u16,
-    pub tls_hostname: String,
+    pub no_delay: bool,
     pub timeout: Duration,
     pub traffic_limit_min: NonZeroU32,
     pub traffic_limit_sec: NonZeroU32,
 }
 
 pub struct Proxy {
-    cdc: LegacyCodec,
+    cdc: Arc<LegacyCodec>,
     cfg: ProxyConfig,
-    tls: tokio_native_tls::TlsConnector,
+    listen_addr: IpAddr,
+    listen_port: u16,
+    connector: ProxyConnector,
 }
 
 impl Proxy {
-    pub fn new(cdc: LegacyCodec, cfg: ProxyConfig, tls: tokio_native_tls::TlsConnector) -> Self {
-        Self { cdc, cfg, tls }
-    }
-
-    async fn connect_to_server(
-        self: Arc<Self>,
-        to_port: u16,
-        remote_addr: Ipv4Addr,
-    ) -> anyhow::Result<ServerConn> {
-        let cfg = &self.cfg;
-        let conn = TcpStream::connect((cfg.server_addr, to_port)).await?;
-        let mut conn = self.tls.connect(&cfg.tls_hostname, conn).await?;
-
-        // 2 + 4 + 4 + 4 = 12 bytes handshake
-        let mut buf = Vec::with_capacity(32);
-        buf.put_u16(0xFE);
-        buf.put_u32(cfg.proxy_id);
-        buf.put_u16(cfg.proxy_version);
-        buf.put(remote_addr.octets().as_slice());
-        conn.write_all(&buf).await?;
-
-        Ok(Framed::new(conn, server_codec()))
+    pub fn new(
+        cdc: Arc<LegacyCodec>,
+        cfg: ProxyConfig,
+        connector: ProxyConnector,
+        listen_addr: IpAddr,
+        listen_port: u16,
+    ) -> Self {
+        Self {
+            cdc,
+            cfg,
+            connector,
+            listen_addr,
+            listen_port,
+        }
     }
 
     pub fn handle_new_conn(
         self: Arc<Self>,
         conn: TcpStream,
-        to_port: u16,
         conn_holder: IpConnectionHolder,
     ) -> anyhow::Result<()> {
         let peer_addr = conn.peer_addr()?;
         // Check peer addr
         log::info!("New connection from {peer_addr}");
         tokio::spawn(async move {
-            if let Err(e) = self.exec_conn(conn, to_port, conn_holder).await {
+            if let Err(e) = self.exec_conn(conn, conn_holder).await {
                 log::error!("Error while handling connection from {peer_addr}: {e}");
             }
         });
@@ -164,36 +155,26 @@ impl Proxy {
     async fn exec_conn(
         self: Arc<Self>,
         conn: TcpStream,
-        to_port: u16,
         holder: IpConnectionHolder,
     ) -> anyhow::Result<()> {
-        let IpAddr::V4(addr) = conn.peer_addr()?.ip() else {
-            return Err(anyhow::anyhow!("Ipv6 not supported"));
-        };
-
+        let addr = conn.peer_addr()?.ip();
         let t = self.cfg.timeout;
-
         let conn = timeout(t, self.cdc.create_server(conn)).await??;
-        let server_conn = timeout(t, self.clone().connect_to_server(to_port, addr)).await??;
-        ProxyConn::new(server_conn, conn, &self.cfg, holder)
+        let server_conn = timeout(t, self.connector.connect(addr)).await??;
+        ProxySession::new(server_conn, conn, &self.cfg, holder)
             .run()
             .await
     }
 
-    pub async fn run(
-        self: Arc<Self>,
-        mut ip_limiter: IpLimiter<Ipv4Addr>,
-    ) -> anyhow::Result<()> {
-        let first_mapping = self.cfg.port_mappings.first().unwrap();
-        let listener = TcpListener::bind((
-            Ipv4Addr::UNSPECIFIED,
-            first_mapping.0,
-        ))
-        .await?;
+    pub async fn run(self: Arc<Self>, mut ip_limiter: IpLimiter<Ipv4Addr>) -> anyhow::Result<()> {
+        let listener = TcpListener::bind((self.listen_addr, self.listen_port)).await?;
 
         let mut listener = TcpListenerStream::new(listener);
         while let Some(stream) = listener.next().await {
             let stream = stream?;
+            if self.cfg.no_delay {
+                stream.set_nodelay(true)?;
+            }
 
             let addr = stream.peer_addr()?.ip();
             let IpAddr::V4(addr) = addr else {
@@ -205,7 +186,7 @@ impl Proxy {
                 continue;
             };
 
-            self.clone().handle_new_conn(stream, first_mapping.1, conn_holder)?;
+            self.clone().handle_new_conn(stream, conn_holder)?;
         }
 
         Ok(())

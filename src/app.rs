@@ -1,52 +1,63 @@
 use std::{
-    net::IpAddr,
-    num::{NonZeroU32, NonZeroUsize},
+    net::{IpAddr, Ipv4Addr},
+    num::NonZeroUsize,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
 use duration_string::DurationString;
+use futures::future::try_join_all;
+use http::Uri;
 use serde::Deserialize;
 use shroom_net::{
     codec::legacy::{handshake_gen::BasicHandshakeGenerator, LegacyCodec},
     crypto::CryptoContext,
 };
 use tokio_native_tls::native_tls::{Certificate, TlsConnector};
+use tokio_websockets::Connector;
 
 use crate::{
     ip_limiter::{self, IpBlacklist},
     proxy,
+    proxy_conn::ProxyConnector,
 };
 
-const PROXY_VERSION: u16 = 1;
+
+const fn nonzu(v: usize) -> NonZeroUsize {
+    if let Some(v) = NonZeroUsize::new(v) {
+        v
+    } else {
+        panic!("Expected non-zero usize")
+    }
+}
 
 fn default_timeout() -> DurationString {
     DurationString::new(Duration::from_secs(30))
 }
 
-const fn default_traffic_limit_min() -> u32 {
-    2048 * 20
+const fn default_traffic_limit_min() -> NonZeroUsize {
+    nonzu(2048 * 20)
 }
 
-const fn default_traffic_limit_sec() -> u32 {
-    2048
+const fn default_traffic_limit_sec() -> NonZeroUsize {
+    nonzu(2048 * 20)
 }
 
 const fn v83() -> u16 {
     83
 }
 
-const fn default_ip_cache() -> usize {
-    4096
+const fn default_ip_cache() -> NonZeroUsize {
+    nonzu(4096)
 }
 
 const fn default_conn_limit() -> usize {
     12
 }
 
-const fn default_conn_limit_min() -> u32 {
-    12
+const fn default_conn_limit_min() -> NonZeroUsize {
+    nonzu(12)
 }
 
 #[derive(Deserialize, Debug)]
@@ -56,10 +67,30 @@ pub struct AppConfig {
     pub mappings: Vec<ProxyMapping>,
 }
 
+#[derive(Debug)]
+pub struct ConfigUri(pub Uri);
+
+impl<'de> Deserialize<'de> for ConfigUri {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map(ConfigUri)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for ConfigUri {
+    type Err = http::uri::InvalidUri;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(ConfigUri(Uri::from_str(s)?))
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ProxyMapping {
     pub from_port: u16,
-    pub to_port: u16,
+    pub to: ConfigUri,
 }
 
 #[derive(Deserialize, Debug)]
@@ -75,18 +106,18 @@ pub struct AppProxyConfig {
     #[serde(default = "default_timeout")]
     pub timeout: DurationString,
     #[serde(default = "default_traffic_limit_min")]
-    pub traffic_limit_min: u32,
+    pub traffic_limit_min: NonZeroUsize,
     #[serde(default = "default_traffic_limit_sec")]
-    pub traffic_limit_sec: u32,
+    pub traffic_limit_sec: NonZeroUsize,
     #[serde(default = "v83")]
     pub shroom_version: u16,
     pub blacklist_file: Option<String>,
     #[serde(default = "default_ip_cache")]
-    pub ip_cache: usize,
+    pub ip_cache: NonZeroUsize,
     #[serde(default = "default_conn_limit")]
     pub conn_limit: usize,
     #[serde(default = "default_conn_limit_min")]
-    pub conn_limit_min: u32,
+    pub conn_limit_min: NonZeroUsize,
 }
 
 pub struct App {
@@ -98,51 +129,82 @@ impl App {
         Self { cfg }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        let server_cfg = &self.cfg.server;
-        let proxy_cfg = &self.cfg.proxy;
-        let cert = std::fs::read(&server_cfg.certificate)?;
-
-        let blacklist = if let Some(blacklist_file) = &proxy_cfg.blacklist_file {
-            let blacklist = std::fs::read_to_string(blacklist_file)?;
-            log::info!("Loaded blacklist from {}", blacklist_file);
-            IpBlacklist::from_str(&blacklist)?
-        } else {
-            IpBlacklist::default()
-        };
-
+    fn connector(&self) -> anyhow::Result<Connector> {
+        let cert = std::fs::read(&self.cfg.server.certificate)?;
         let cx = TlsConnector::builder()
             .add_root_certificate(Certificate::from_pem(&cert)?)
             .build()?;
-        let cx = tokio_native_tls::TlsConnector::from(cx);
+        Ok(Connector::NativeTls(cx.into()))
+    }
 
-        let proxy_cfg_ = proxy::ProxyConfig {
-            server_addr: server_cfg.server_addr,
-            port_mappings: self
-                .cfg
-                .mappings
+    fn codec(&self) -> LegacyCodec {
+        LegacyCodec::new(
+            CryptoContext::default().into(),
+            BasicHandshakeGenerator::global(self.cfg.proxy.shroom_version),
+        )
+    }
+
+    fn blacklist(&self) -> IpBlacklist<Ipv4Addr> {
+        if let Some(blacklist_file) = &self.cfg.proxy.blacklist_file {
+            let blacklist = std::fs::read_to_string(blacklist_file).unwrap();
+            log::info!("Loaded blacklist from {}", blacklist_file);
+            IpBlacklist::from_str(&blacklist).unwrap()
+        } else {
+            IpBlacklist::default()
+        }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        let server_cfg = &self.cfg.server;
+        let proxy_cfg = &self.cfg.proxy;
+
+        if server_cfg.server_addr.is_ipv6() {
+            log::error!("IPv6 is not supported");
+            return Ok(());
+        }
+
+        let blacklist = Arc::new(self.blacklist());
+        let connector = Arc::new(self.connector()?);
+        let cdc = Arc::new(self.codec());
+
+        let proxies = self
+            .cfg
+            .mappings
+            .iter()
+            .map(|mapping| {
+                let proxy_connector = ProxyConnector::new(
+                    connector.clone(),
+                    mapping.to.0.clone(),
+                    server_cfg.tls_hostname.clone(),
+                );
+
+                let proxy_cfg = proxy::ProxyConfig {
+                    timeout: proxy_cfg.timeout.into(),
+                    traffic_limit_min: proxy_cfg.traffic_limit_min.try_into().unwrap(),
+                    traffic_limit_sec: proxy_cfg.traffic_limit_sec.try_into().unwrap(),
+                    no_delay: true,
+                };
+
+                Arc::new(proxy::Proxy::new(
+                    cdc.clone(),
+                    proxy_cfg,
+                    proxy_connector,
+                    server_cfg.server_addr,
+                    mapping.from_port,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        try_join_all(
+            proxies
                 .iter()
-                .map(|m| (m.from_port, m.to_port))
-                .collect(),
-            proxy_id: proxy_cfg.proxy_id,
-            proxy_version: PROXY_VERSION,
-            tls_hostname: server_cfg.tls_hostname.clone(),
-            timeout: proxy_cfg.timeout.into(),
-            traffic_limit_min: std::num::NonZeroU32::new(proxy_cfg.traffic_limit_min).unwrap(),
-            traffic_limit_sec: std::num::NonZeroU32::new(proxy_cfg.traffic_limit_sec).unwrap(),
-        };
-
-        let handshake_gen = BasicHandshakeGenerator::global(proxy_cfg.shroom_version);
-        let cdc = LegacyCodec::new(CryptoContext::default().into(), handshake_gen);
-        let proxy = Arc::new(proxy::Proxy::new(cdc, proxy_cfg_, cx));
-
-        let limiter = ip_limiter::IpLimiter::new(
-            blacklist,
-            NonZeroUsize::new(proxy_cfg.ip_cache).unwrap(),
-            NonZeroU32::new(proxy_cfg.conn_limit_min).unwrap(),
-            proxy_cfg.conn_limit,
-        );
-        proxy.run(limiter).await?;
+                .map(|proxy| proxy.clone().run(ip_limiter::IpLimiter::new(
+                    blacklist.clone(),
+                    proxy_cfg.ip_cache,
+                    proxy_cfg.conn_limit_min.try_into().unwrap(),
+                    proxy_cfg.conn_limit,
+                ))),
+        ).await.unwrap();
 
         Ok(())
     }

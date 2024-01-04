@@ -10,8 +10,8 @@ blacklist_file = "blacklist/ipsum.txt"
 
 [[mappings]]
 from_port = 9484
-to_port = 8484
+to = "wss://127.0.0.1:8484/shroom"
 
 [[mappings]]
 from_port = 9485
-to_port = 8485
+to = "wss://127.0.0.1:8485/shroom"
