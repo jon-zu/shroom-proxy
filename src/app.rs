@@ -12,7 +12,7 @@ use http::Uri;
 use serde::Deserialize;
 use shroom_net::{
     codec::legacy::{handshake_gen::BasicHandshakeGenerator, LegacyCodec},
-    crypto::CryptoContext,
+    CryptoContext,
 };
 use tokio_native_tls::native_tls::{Certificate, TlsConnector};
 use tokio_websockets::Connector;

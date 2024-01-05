@@ -26,8 +26,6 @@ path = "src/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-#shroom-net = { git = "ssh://git@github.com/jon-zu/shroom-net.git" }
-shroom-net = { path = "/home/jonas/projects/shroom/shroom-net/crates/shroom-net" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tokio-util = { version = "0.7", features = ["net"] }
@@ -43,7 +41,7 @@ clap = { version = "4.4.12", features = ["derive"] }
 lru = "0.12.1"
 env_logger = "0.10.1"
 duration-string = { version = "0.3.0", features = ["serde"] }
-#tokio-websockets = { version = "0.5.1", features = ["native-tls", "client", "ring", "rand"] }
-tokio-websockets = {path = "/home/jonas/projects/tokio-websockets", features = ["native-tls", "client", "ring", "rand", "server"] }
 http = "1.0.0"
 bytes = "1.5.0"
+tokio-websockets = {path = "/home/jonas/projects/tokio-websockets", features = ["native-tls", "client", "ring", "rand", "server"] }
+shroom-net = { path = "/home/jonas/projects/shroom/shroom-net/crates/shroom-net" }

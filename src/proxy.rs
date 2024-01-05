@@ -16,7 +16,7 @@ use governor::{
 
 use shroom_net::{
     codec::{legacy::LegacyCodec, ShroomCodec},
-    ShroomConn,
+    ShroomStream,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -32,7 +32,7 @@ use crate::{
 
 //const PACKET_LEN_LIMIT: usize = 8 * 1024;
 
-type RemoteConn = ShroomConn<LegacyCodec>;
+type RemoteConn = ShroomStream<LegacyCodec>;
 
 pub type RateLimiter =
     governor::RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>;
@@ -63,8 +63,8 @@ impl ProxySession {
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        let (remote_r, remote_w) = self.remote.split();
+    pub async fn run(self) -> anyhow::Result<()> {
+        let (mut remote_w, mut remote_r) = self.remote.into_split();
         let (mut server_w, mut server_r) = self.server.split();
 
         log::info!("Running proxy: {}", self.timeout.as_nanos());
@@ -72,11 +72,11 @@ impl ProxySession {
         let reader = async move {
             while let Some(pkt) = remote_r.next().await {
                 let pkt = pkt?;
-                let n = NonZeroU32::new(pkt.as_ref().len() as u32 + 4).unwrap();
+                let n = NonZeroU32::new(pkt.len() as u32 + 4).unwrap();
                 self.limit_m.until_n_ready(n).await?;
                 self.limit_s.until_n_ready(n).await?;
 
-                server_w.send(pkt.as_ref().clone().into()).await?;
+                server_w.send(pkt.as_bytes().clone().into()).await?;
             }
 
             anyhow::Ok(())
@@ -85,7 +85,7 @@ impl ProxySession {
         let writer = async move {
             while let Some(pkt) = server_r.next().await {
                 let pkt = pkt?;
-                remote_w.send(pkt).await?;
+                remote_w.send(&pkt).await?;
             }
 
             anyhow::Ok(())
@@ -96,7 +96,8 @@ impl ProxySession {
             w = writer => w?,
         }
 
-        self.remote.close().await?;
+        //self.remote.close().await?;
+        //TODO should this get closed here
         //server_w.close().await?;
         Ok(())
     }

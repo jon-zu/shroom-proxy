@@ -1,16 +1,17 @@
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
-    time::{Duration, Instant}
+    time::{Duration, Instant}, ops::Deref
 };
 
+use anyhow::Context;
 use futures::{future::try_join_all, SinkExt, StreamExt};
 use shroom_net::{
     codec::{
         legacy::{handshake_gen::BasicHandshakeGenerator, LegacyCodec},
         ShroomCodec,
     },
-    crypto::CryptoContext,
+    CryptoContext, Packet,
 };
 use shroom_proxy::app::{App, AppConfig, AppProxyConfig, AppServerConfig, ProxyMapping};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,19 +26,19 @@ async fn run_shroom_client(
     chunks: usize,
 ) -> anyhow::Result<()> {
     let io = TcpStream::connect(SocketAddrV4::new(addr, port)).await?;
-    let mut client = cdc.create_client(io).await?;
-    let (rx, tx) = client.split();
+    let client = cdc.create_client(io).await?;
+    let (mut tx, mut rx) = client.into_split();
 
-    const PKT: [u8; 4096] = [0xFFu8; 4096];
+    static PKT: &'static [u8; 4096] = &[0xFFu8; 4096];
     let chunk = pkts / chunks;
     for i in 0..chunk {
         for _ in 0..chunks {
-            tx.send(&PKT).await?;
+            tx.send(Packet::from_static(PKT)).await?;
         }
 
         for _ in 0..chunks {
-            let pkt = rx.next().await.unwrap().unwrap();
-            assert_eq!(pkt.as_ref().as_ref(), PKT);
+            let pkt = rx.next().await.context("eof")??;
+            assert_eq!(pkt.deref(), PKT);
         }
         if i % 100 == 0 {
             println!("Sent: {}", i);

@@ -1,12 +1,9 @@
-use std::{
-    net::IpAddr,
-    ops::Deref,
-    sync::Arc,
-};
+use std::{net::IpAddr, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use http::{HeaderName, Uri};
+use shroom_net::Packet;
 use tokio::net::TcpStream;
 use tokio_websockets::{
     client::{self},
@@ -63,6 +60,12 @@ impl TryFrom<Message> for ProxyPacket {
             )));
         }
         Ok(Self(value.into_payload()))
+    }
+}
+
+impl From<Packet> for ProxyPacket {
+    fn from(value: Packet) -> Self {
+        Self(Payload::from(value.as_bytes().clone()))
     }
 }
 
